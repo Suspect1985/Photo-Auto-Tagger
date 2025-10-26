@@ -156,39 +156,100 @@ class ExifExtractor:
     """Extract date and GPS metadata from image files."""
 
     @staticmethod
-    def extract_metadata(image_path: str) -> Tuple[Optional[str], Optional[str]]:
+    def extract_metadata(image_path: str) -> Tuple[Optional[str], Optional[str], str]:
         """
         Extract creation date and location from image.
-        Returns: (creation_date_str, location_str)
+        Returns: (creation_date_str, location_str, debug_message)
         """
+        creation_date = None
+        location = None
+        debug_parts = []
+
+        # Try Method 1: Modern Pillow getexif() (no underscore)
         try:
-            # Try to get EXIF data
             with Image.open(image_path) as img:
-                exif_data = img._getexif()
+                exif_data = img.getexif()
 
-            creation_date = None
-            location = None
+                if exif_data and len(exif_data) > 0:
+                    debug_parts.append(f"Pillow found {len(exif_data)} EXIF tags")
 
-            # Extract creation date
-            if exif_data:
-                creation_date = ExifExtractor._extract_date(exif_data, image_path)
-                location = ExifExtractor._extract_location(exif_data)
+                    creation_date = ExifExtractor._extract_date_from_pillow(exif_data)
+                    if creation_date:
+                        debug_parts.append("Date extracted via Pillow")
 
-            # Fallback to file modification time if no EXIF date
-            if not creation_date:
-                creation_date = ExifExtractor._get_file_creation_date(image_path)
-
-            return creation_date, location
-
+                    location = ExifExtractor._extract_location_from_pillow(exif_data)
+                    if location:
+                        debug_parts.append("GPS extracted via Pillow")
+                    elif 34853 in exif_data:
+                        # GPS IFD exists but might not have coordinates
+                        try:
+                            gps_ifd = exif_data.get_ifd(34853)
+                            gps_tags = list(gps_ifd.keys()) if gps_ifd else []
+                            has_coords = all(tag in gps_tags for tag in [1, 2, 3, 4])
+                            if has_coords:
+                                debug_parts.append("GPS coords exist but failed to convert")
+                            else:
+                                debug_parts.append(f"GPS IFD present but no coordinates (tags: {gps_tags})")
+                        except:
+                            debug_parts.append("GPS tag exists but inaccessible")
+                    else:
+                        debug_parts.append("No GPS tag (34853)")
+                else:
+                    debug_parts.append("Pillow: No EXIF data")
         except Exception as e:
-            # Fallback for files without EXIF or errors
+            debug_parts.append(f"Pillow error: {type(e).__name__}: {str(e)}")
+
+        # Try Method 2: piexif library (better for some formats)
+        if not creation_date or not location:
+            try:
+                exif_dict = piexif.load(image_path)
+
+                # Check if any EXIF data exists
+                has_data = any(exif_dict.get(ifd) for ifd in ["0th", "Exif", "GPS", "1st"])
+
+                if has_data:
+                    debug_parts.append("piexif found EXIF data")
+
+                    if not creation_date:
+                        creation_date = ExifExtractor._extract_date_from_piexif(exif_dict)
+                        if creation_date:
+                            debug_parts.append("Date extracted via piexif")
+
+                    if not location and "GPS" in exif_dict and exif_dict["GPS"]:
+                        gps_ifd = exif_dict["GPS"]
+                        gps_tag_ids = list(gps_ifd.keys())
+                        has_coords = all(tag in gps_tag_ids for tag in [piexif.GPSIFD.GPSLatitude,
+                                                                          piexif.GPSIFD.GPSLatitudeRef,
+                                                                          piexif.GPSIFD.GPSLongitude,
+                                                                          piexif.GPSIFD.GPSLongitudeRef])
+
+                        if has_coords:
+                            location = ExifExtractor._extract_location_from_piexif(exif_dict)
+                            if location:
+                                debug_parts.append("GPS extracted via piexif")
+                            else:
+                                debug_parts.append("GPS coords exist but piexif conversion failed")
+                        else:
+                            debug_parts.append(f"GPS IFD missing coordinates (has tags: {gps_tag_ids})")
+                    elif not location:
+                        debug_parts.append("No GPS IFD in piexif")
+                else:
+                    debug_parts.append("piexif: No EXIF data")
+            except Exception as e:
+                debug_parts.append(f"piexif error: {type(e).__name__}: {str(e)}")
+
+        # Fallback to file modification time if no EXIF date
+        if not creation_date:
             creation_date = ExifExtractor._get_file_creation_date(image_path)
-            return creation_date, None
+            debug_parts.append("Using file mtime")
+
+        debug_message = " | ".join(debug_parts)
+        return creation_date, location, debug_message
 
     @staticmethod
-    def _extract_date(exif_data: dict, image_path: str) -> Optional[str]:
-        """Extract creation date from EXIF data."""
-        # Try different date tags
+    def _extract_date_from_pillow(exif_data) -> Optional[str]:
+        """Extract creation date from Pillow's getexif() data."""
+        # Try different date tags in order of preference
         date_tags = [
             36867,  # DateTimeOriginal
             36868,  # DateTimeDigitized
@@ -198,37 +259,153 @@ class ExifExtractor:
         for tag in date_tags:
             if tag in exif_data:
                 date_str = exif_data[tag]
-                try:
-                    # EXIF date format: "YYYY:MM:DD HH:MM:SS"
-                    dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
-                    return dt.isoformat()
-                except:
-                    continue
+                if date_str:
+                    try:
+                        # EXIF date format: "YYYY:MM:DD HH:MM:SS"
+                        dt = datetime.strptime(str(date_str), "%Y:%m:%d %H:%M:%S")
+                        return dt.isoformat()
+                    except:
+                        continue
 
         return None
 
     @staticmethod
-    def _extract_location(exif_data: dict) -> Optional[str]:
-        """Extract GPS location from EXIF data and format as 'Lat, Long'."""
+    def _extract_date_from_piexif(exif_dict: dict) -> Optional[str]:
+        """Extract creation date from piexif data."""
+        try:
+            # Check Exif IFD for date tags
+            if "Exif" in exif_dict:
+                exif_ifd = exif_dict["Exif"]
+
+                # Try DateTimeOriginal first (most reliable)
+                if piexif.ExifIFD.DateTimeOriginal in exif_ifd:
+                    date_bytes = exif_ifd[piexif.ExifIFD.DateTimeOriginal]
+                    date_str = date_bytes.decode('utf-8') if isinstance(date_bytes, bytes) else date_bytes
+                    dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                    return dt.isoformat()
+
+                # Try DateTimeDigitized
+                if piexif.ExifIFD.DateTimeDigitized in exif_ifd:
+                    date_bytes = exif_ifd[piexif.ExifIFD.DateTimeDigitized]
+                    date_str = date_bytes.decode('utf-8') if isinstance(date_bytes, bytes) else date_bytes
+                    dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                    return dt.isoformat()
+
+            # Check main IFD for DateTime
+            if "0th" in exif_dict:
+                zeroth_ifd = exif_dict["0th"]
+                if piexif.ImageIFD.DateTime in zeroth_ifd:
+                    date_bytes = zeroth_ifd[piexif.ImageIFD.DateTime]
+                    date_str = date_bytes.decode('utf-8') if isinstance(date_bytes, bytes) else date_bytes
+                    dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                    return dt.isoformat()
+
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _extract_location_from_pillow(exif_data) -> Optional[str]:
+        """Extract GPS location from Pillow's getexif() data and format as 'Lat, Long'."""
         try:
             # GPS info is in tag 34853
             if 34853 not in exif_data:
                 return None
 
-            gps_info = exif_data[34853]
+            # Try to get GPS IFD - this can fail even if tag exists
+            try:
+                gps_info = exif_data.get_ifd(34853)
+            except (KeyError, AttributeError, TypeError) as e:
+                # get_ifd might not be available or GPS IFD might be malformed
+                return None
+
+            if not gps_info:
+                return None
+
+            # DEBUG: Check which GPS tags are present
+            # Common GPS tags: 1=LatRef, 2=Lat, 3=LonRef, 4=Lon
+            available_tags = list(gps_info.keys())
+
+            # Extract latitude (tag 2 = GPSLatitude, tag 1 = GPSLatitudeRef)
+            if 2 not in gps_info:
+                return None  # Missing latitude data
+            if 1 not in gps_info:
+                return None  # Missing latitude reference
+
+            lat_data = gps_info[2]
+            lat = ExifExtractor._convert_to_degrees(lat_data)
+            if lat is None:
+                return None
+
+            lat_ref = gps_info[1]
+            # Handle both string and bytes
+            if isinstance(lat_ref, bytes):
+                lat_ref = lat_ref.decode('utf-8', errors='ignore')
+            if lat_ref == 'S':
+                lat = -lat
+
+            # Extract longitude (tag 4 = GPSLongitude, tag 3 = GPSLongitudeRef)
+            if 4 not in gps_info:
+                return None  # Missing longitude data
+            if 3 not in gps_info:
+                return None  # Missing longitude reference
+
+            lon_data = gps_info[4]
+            lon = ExifExtractor._convert_to_degrees(lon_data)
+            if lon is None:
+                return None
+
+            lon_ref = gps_info[3]
+            # Handle both string and bytes
+            if isinstance(lon_ref, bytes):
+                lon_ref = lon_ref.decode('utf-8', errors='ignore')
+            if lon_ref == 'W':
+                lon = -lon
+
+            return f"{lat:.6f}, {lon:.6f}"
+
+        except Exception as e:
+            # Last resort catch-all
+            return None
+
+    @staticmethod
+    def _extract_location_from_piexif(exif_dict: dict) -> Optional[str]:
+        """Extract GPS location from piexif data and format as 'Lat, Long'."""
+        try:
+            if "GPS" not in exif_dict or not exif_dict["GPS"]:
+                return None
+
+            gps_info = exif_dict["GPS"]
 
             # Extract latitude
-            if 2 not in gps_info or 1 not in gps_info:
+            if piexif.GPSIFD.GPSLatitude not in gps_info or piexif.GPSIFD.GPSLatitudeRef not in gps_info:
                 return None
-            lat = ExifExtractor._convert_to_degrees(gps_info[2])
-            if gps_info[1] == 'S':
+
+            lat = ExifExtractor._convert_to_degrees_piexif(gps_info[piexif.GPSIFD.GPSLatitude])
+            if lat is None:
+                return None
+
+            lat_ref = gps_info[piexif.GPSIFD.GPSLatitudeRef]
+            # Handle both string and bytes
+            if isinstance(lat_ref, bytes):
+                lat_ref = lat_ref.decode('utf-8', errors='ignore')
+            if lat_ref == 'S':
                 lat = -lat
 
             # Extract longitude
-            if 4 not in gps_info or 3 not in gps_info:
+            if piexif.GPSIFD.GPSLongitude not in gps_info or piexif.GPSIFD.GPSLongitudeRef not in gps_info:
                 return None
-            lon = ExifExtractor._convert_to_degrees(gps_info[4])
-            if gps_info[3] == 'W':
+
+            lon = ExifExtractor._convert_to_degrees_piexif(gps_info[piexif.GPSIFD.GPSLongitude])
+            if lon is None:
+                return None
+
+            lon_ref = gps_info[piexif.GPSIFD.GPSLongitudeRef]
+            # Handle both string and bytes
+            if isinstance(lon_ref, bytes):
+                lon_ref = lon_ref.decode('utf-8', errors='ignore')
+            if lon_ref == 'W':
                 lon = -lon
 
             return f"{lat:.6f}, {lon:.6f}"
@@ -237,10 +414,44 @@ class ExifExtractor:
             return None
 
     @staticmethod
-    def _convert_to_degrees(value) -> float:
-        """Convert GPS coordinates to degrees."""
-        d, m, s = value
-        return float(d) + float(m) / 60.0 + float(s) / 3600.0
+    def _convert_to_degrees(value) -> Optional[float]:
+        """Convert GPS coordinates to degrees from Pillow format."""
+        try:
+            # Pillow returns tuples of floats or IFDRational objects
+            if not isinstance(value, (list, tuple)) or len(value) < 3:
+                return None
+
+            d, m, s = value[0], value[1], value[2]
+
+            # Handle both regular floats and IFDRational objects (tuples)
+            d_val = float(d) if not isinstance(d, tuple) else (float(d[0]) / float(d[1]) if d[1] != 0 else 0)
+            m_val = float(m) if not isinstance(m, tuple) else (float(m[0]) / float(m[1]) if m[1] != 0 else 0)
+            s_val = float(s) if not isinstance(s, tuple) else (float(s[0]) / float(s[1]) if s[1] != 0 else 0)
+
+            return d_val + m_val / 60.0 + s_val / 3600.0
+        except (TypeError, ValueError, ZeroDivisionError, IndexError):
+            return None
+
+    @staticmethod
+    def _convert_to_degrees_piexif(value) -> Optional[float]:
+        """Convert GPS coordinates to degrees from piexif format (tuples of rationals)."""
+        try:
+            if not isinstance(value, (list, tuple)) or len(value) < 3:
+                return None
+
+            d, m, s = value[0], value[1], value[2]
+
+            # piexif returns tuples of (numerator, denominator)
+            if not all(isinstance(x, tuple) and len(x) == 2 for x in [d, m, s]):
+                return None
+
+            d_val = d[0] / d[1] if d[1] != 0 else 0
+            m_val = m[0] / m[1] if m[1] != 0 else 0
+            s_val = s[0] / s[1] if s[1] != 0 else 0
+
+            return d_val + m_val / 60.0 + s_val / 3600.0
+        except (TypeError, ValueError, ZeroDivisionError, IndexError):
+            return None
 
     @staticmethod
     def _get_file_creation_date(image_path: str) -> str:
@@ -306,6 +517,9 @@ class AutoTaggerWorker(QThread):
             # Phase 1: Extract metadata and insert photos
             self.phase_update.emit("Extracting metadata...")
             metadata_list = []
+            exif_success_count = 0
+            exif_missing_count = 0
+            sample_debug_messages = []  # Store first few for logging
 
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {
@@ -320,12 +534,31 @@ class AutoTaggerWorker(QThread):
 
                     img_path = futures[future]
                     try:
-                        created_at, location = future.result()
+                        created_at, location, debug_msg = future.result()
                         metadata_list.append((img_path, created_at, location))
+
+                        # Track EXIF extraction success
+                        if location and location != "Unknown Location":
+                            exif_success_count += 1
+                        else:
+                            exif_missing_count += 1
+                            # Log first 3 failed extractions for debugging
+                            if len(sample_debug_messages) < 3:
+                                sample_debug_messages.append(f"{os.path.basename(img_path)}: {debug_msg}")
+
                         self.progress_update.emit(i + 1, total_files)
                     except Exception as e:
                         self.log_message.emit(f"Error reading {os.path.basename(img_path)}: {str(e)}")
                         errors += 1
+
+            # Log EXIF extraction summary
+            self.log_message.emit(f"EXIF data found: {exif_success_count} images, Missing: {exif_missing_count} images")
+
+            # Log sample debug messages to help diagnose issues
+            if sample_debug_messages:
+                self.log_message.emit("Sample EXIF extraction details:")
+                for msg in sample_debug_messages:
+                    self.log_message.emit(f"  {msg}")
 
             if self.is_cancelled:
                 db.close()

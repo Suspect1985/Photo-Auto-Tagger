@@ -117,3 +117,4 @@ sqlite3 photo_library.db
 SELECT * FROM Tags;
 SELECT * FROM Photo_Tags_Link;
 ```
+- changes made
