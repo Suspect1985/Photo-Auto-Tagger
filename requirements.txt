@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+Pillow>=10.0.0
+piexif>=1.1.3
+pyinstaller>=6.0.0
